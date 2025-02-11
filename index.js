@@ -1,4 +1,3 @@
-const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 const { google } = require("googleapis");
@@ -10,36 +9,20 @@ dotenv.config();
 const app = express();
 
 // Middleware
-app.use(express.json());
 app.use(cors());
+app.use(express.json());
 
 // Constants
-const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
-const TOKEN_PATH = "token.json";
 const PORT = process.env.PORT || 3000;
+const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 
 // Initialize OAuth2 client
-let oAuth2Client;
-
-try {
-  const credentials = JSON.parse(fs.readFileSync("credentials.json"));
-  const { client_secret, client_id } = credentials;
-
-  oAuth2Client = new google.auth.OAuth2(
-    client_id,
-    client_secret,
-    "https://meet-link-api.vercel.app/oauth2callback"
-  );
-
-  // Load existing token if it exists
-  if (fs.existsSync(TOKEN_PATH)) {
-    const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
-    oAuth2Client.setCredentials(token);
-  }
-} catch (error) {
-  console.error("Error loading credentials:", error);
-  process.exit(1);
-}
+const oAuth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.REDIRECT_URI ||
+    "https://meet-link-api.vercel.app/api/oauth2callback"
+);
 
 // Helper function to create Google Meet event
 async function createGoogleMeet(
@@ -84,42 +67,48 @@ async function createGoogleMeet(
   }
 }
 
-// Routes
-app.get("/login", (req, res) => {
-  if (!oAuth2Client) {
-    return res.status(500).send("OAuth2 client not initialized");
-  }
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: "OK", message: "Server is running" });
+});
 
+// OAuth2 login endpoint
+app.get("/api/login", (req, res) => {
   const authUrl = oAuth2Client.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
+    prompt: "consent",
   });
   res.redirect(authUrl);
 });
 
-app.get("/oauth2callback", async (req, res) => {
+// OAuth2 callback endpoint
+app.get("/api/oauth2callback", async (req, res) => {
   const { code } = req.query;
+
   if (!code) {
-    return res.status(400).send("No authorization code received");
+    return res.status(400).json({ error: "Authorization code is required" });
   }
 
   try {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
 
-    // Save token for future use
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+    // Store tokens in environment variable
+    process.env.GOOGLE_TOKENS = JSON.stringify(tokens);
 
     res.send("Authentication successful! You can close this window.");
   } catch (error) {
     console.error("Error retrieving access token:", error);
-    res.status(500).send("Error retrieving access token");
+    res.status(500).json({ error: "Failed to retrieve access token" });
   }
 });
 
-app.post("/create-meeting", async (req, res) => {
+// Create meeting endpoint
+app.post("/api/create-meeting", async (req, res) => {
   const { summary, description, startTime, endTime, attendees } = req.body;
 
+  // Validate required fields
   if (!summary || !startTime || !endTime || !attendees) {
     return res.status(400).json({
       error: "Missing required fields",
@@ -127,7 +116,18 @@ app.post("/create-meeting", async (req, res) => {
     });
   }
 
+  // Check authentication
+  const tokens = process.env.GOOGLE_TOKENS;
+  if (!tokens) {
+    return res
+      .status(401)
+      .json({ error: "Not authenticated. Please login first." });
+  }
+
   try {
+    // Set credentials from environment variable
+    oAuth2Client.setCredentials(JSON.parse(tokens));
+
     const meetingLink = await createGoogleMeet(
       summary,
       description,
@@ -135,17 +135,30 @@ app.post("/create-meeting", async (req, res) => {
       endTime,
       attendees
     );
+
     res.json({ meetingLink });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log("Available endpoints:");
-  console.log("- GET  /login           : Start OAuth2 flow");
-  console.log("- GET  /oauth2callback   : OAuth2 callback URL");
-  console.log("- POST /create-meeting   : Create a new Google Meet");
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: "Something went wrong!" });
 });
+
+// Start server only in development
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+    console.log("Available endpoints:");
+    console.log("- GET  /api/health         : Health check");
+    console.log("- GET  /api/login          : Start OAuth2 flow");
+    console.log("- GET  /api/oauth2callback  : OAuth2 callback URL");
+    console.log("- POST /api/create-meeting  : Create a new Google Meet");
+  });
+}
+
+// Export for Vercel
+module.exports = app;
