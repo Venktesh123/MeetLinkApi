@@ -23,7 +23,7 @@ let oAuth2Client;
 
 try {
   const credentials = JSON.parse(fs.readFileSync("credentials.json"));
-  const { client_secret, client_id } = credentials.web;
+  const { client_secret, client_id } = credentials;
 
   oAuth2Client = new google.auth.OAuth2(
     client_id,
