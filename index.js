@@ -28,7 +28,7 @@ try {
   oAuth2Client = new google.auth.OAuth2(
     client_id,
     client_secret,
-    "http://localhost:3000/oauth2callback"
+    "https://meet-link-api.vercel.app/oauth2callback"
   );
 
   // Load existing token if it exists
