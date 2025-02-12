@@ -151,9 +151,7 @@ app.get("/api/oauth2callback", async (req, res) => {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
 
-    res.send(
-      "Authentication successful! You can close this window and proceed to create a meeting."
-    );
+    res.send("Authentication successful! You can now create meetings.");
   } catch (error) {
     console.error("Error retrieving access token:", error);
     res.status(500).json({
@@ -175,10 +173,11 @@ app.post("/api/create-meeting", async (req, res) => {
   }
 
   try {
-    // Get new access token using authCode
+    // Fetch a new token using the authorization code
     const { tokens } = await oAuth2Client.getToken(authCode);
     oAuth2Client.setCredentials(tokens);
 
+    // Create Google Meet meeting
     const meetLink = await createGoogleMeet(
       summary,
       description,
