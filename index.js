@@ -149,38 +149,29 @@ app.get("/api/oauth2callback", async (req, res) => {
 
   try {
     const { tokens } = await oAuth2Client.getToken(code);
+    tokens.expiry_date = Date.now() + 30 * 24 * 60 * 60 * 1000;
 
-    if (!tokens.access_token) {
-      throw new Error("No access token received from Google");
-    }
-
-    // Store tokens securely in the database
     await db.collection("tokens").updateOne(
       { userId: "default-user" },
       {
         $set: {
           tokens,
           lastUpdated: new Date(),
-          createdAt: tokens.created_at
-            ? new Date(tokens.created_at)
-            : new Date(),
+          createdAt: new Date(),
         },
       },
       { upsert: true }
     );
 
     oAuth2Client.setCredentials(tokens);
-
     res.send(
-      "Authentication successful! Token stored in the database. You can close this window."
+      "Authentication successful! Token stored in database. You can close this window."
     );
   } catch (error) {
-    console.error(
-      "Error retrieving access token:",
-      error.response?.data || error.message
-    );
+    console.error("Error retrieving access token:", error);
 
-    if (error.response?.data?.error === "invalid_grant") {
+    // Handle "invalid_grant" error by asking user to re-authenticate
+    if (error.response && error.response.data.error === "invalid_grant") {
       return res.status(400).json({
         error: "Invalid grant error",
         message:
