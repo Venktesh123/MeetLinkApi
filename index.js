@@ -149,37 +149,13 @@ app.get("/api/oauth2callback", async (req, res) => {
 
   try {
     const { tokens } = await oAuth2Client.getToken(code);
-    tokens.expiry_date = Date.now() + 30 * 24 * 60 * 60 * 1000;
-
-    await db.collection("tokens").updateOne(
-      { userId: "default-user" },
-      {
-        $set: {
-          tokens,
-          lastUpdated: new Date(),
-          createdAt: new Date(),
-        },
-      },
-      { upsert: true }
-    );
-
     oAuth2Client.setCredentials(tokens);
+
     res.send(
-      "Authentication successful! Token stored in database. You can close this window."
+      "Authentication successful! You can close this window and proceed to create a meeting."
     );
   } catch (error) {
     console.error("Error retrieving access token:", error);
-
-    // Handle "invalid_grant" error by asking user to re-authenticate
-    if (error.response && error.response.data.error === "invalid_grant") {
-      return res.status(400).json({
-        error: "Invalid grant error",
-        message:
-          "Your authorization code may have expired or been used already. Please try logging in again.",
-        loginUrl: "/api/login",
-      });
-    }
-
     res.status(500).json({
       error: "Failed to retrieve access token",
       details: error.message,
@@ -188,62 +164,20 @@ app.get("/api/oauth2callback", async (req, res) => {
 });
 
 app.post("/api/create-meeting", async (req, res) => {
-  const { summary, description, startTime, endTime, attendees } = req.body;
+  const { summary, description, startTime, endTime, attendees, authCode } =
+    req.body;
 
-  if (!summary || !startTime || !endTime || !attendees) {
+  if (!summary || !startTime || !endTime || !attendees || !authCode) {
     return res.status(400).json({
       error: "Missing required fields",
-      required: ["summary", "startTime", "endTime", "attendees"],
+      required: ["summary", "startTime", "endTime", "attendees", "authCode"],
     });
   }
 
   try {
-    const tokenDoc = await db
-      .collection("tokens")
-      .findOne({ userId: "default-user" });
-
-    if (!tokenDoc || !tokenDoc.tokens) {
-      return res.status(401).json({
-        error: "Not authenticated",
-        message: "Please login first",
-        loginUrl: "/api/login",
-      });
-    }
-
-    const tokens = tokenDoc.tokens;
-
-    if (isTokenExpired(tokens)) {
-      if (tokens.refresh_token) {
-        const { credentials } = await oAuth2Client.refreshToken(
-          tokens.refresh_token
-        );
-        const newTokens = {
-          ...tokens,
-          access_token: credentials.access_token,
-          expiry_date: Date.now() + 30 * 24 * 60 * 60 * 1000,
-        };
-
-        await db.collection("tokens").updateOne(
-          { userId: "default-user" },
-          {
-            $set: {
-              tokens: newTokens,
-              lastUpdated: new Date(),
-            },
-          }
-        );
-
-        oAuth2Client.setCredentials(newTokens);
-      } else {
-        return res.status(401).json({
-          error: "Token expired",
-          message: "No refresh token available. Please login again.",
-          loginUrl: "/api/login",
-        });
-      }
-    } else {
-      oAuth2Client.setCredentials(tokens);
-    }
+    // Get new access token using authCode
+    const { tokens } = await oAuth2Client.getToken(authCode);
+    oAuth2Client.setCredentials(tokens);
 
     const meetLink = await createGoogleMeet(
       summary,
@@ -253,7 +187,6 @@ app.post("/api/create-meeting", async (req, res) => {
       attendees
     );
 
-    // Simplified response with just the meet link
     res.json({ meetLink });
   } catch (error) {
     console.error("Error creating meeting:", error);
