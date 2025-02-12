@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { google } = require("googleapis");
 const dotenv = require("dotenv");
+const { MongoClient } = require("mongodb");
 
 // Load environment variables
 dotenv.config();
@@ -16,6 +17,22 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const SCOPES = ["https://www.googleapis.com/auth/calendar.events"];
 
+// MongoDB setup
+const mongoUrl = process.env.MONGODB_URI;
+let db;
+
+async function connectToMongo() {
+  try {
+    const client = await MongoClient.connect(mongoUrl);
+    db = client.db("googleAuth");
+    console.log("Connected to MongoDB");
+  } catch (error) {
+    console.error("MongoDB connection error:", error);
+  }
+}
+
+connectToMongo();
+
 // Initialize OAuth2 client
 const oAuth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -23,6 +40,11 @@ const oAuth2Client = new google.auth.OAuth2(
   process.env.REDIRECT_URI ||
     "https://meet-link-api.vercel.app/api/oauth2callback"
 );
+
+// Helper function to check token expiration
+function isTokenExpired(tokens) {
+  return Date.now() >= tokens.expiry_date - 5 * 60 * 1000; // 5 minutes buffer
+}
 
 // Helper function to create Google Meet event
 async function createGoogleMeet(
@@ -69,7 +91,11 @@ async function createGoogleMeet(
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {
-  res.status(200).json({ status: "OK", message: "Server is running" });
+  res.status(200).json({
+    status: "OK",
+    message: "Server is running",
+    mongoStatus: db ? "Connected" : "Not Connected",
+  });
 });
 
 // OAuth2 login endpoint
@@ -78,11 +104,12 @@ app.get("/api/login", (req, res) => {
     access_type: "offline",
     scope: SCOPES,
     prompt: "consent",
+    expiry_date: Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60, // 30 days
   });
   res.redirect(authUrl);
 });
 
-// OAuth2 callback endpoint
+// OAuth2 callback endpoint with MongoDB storage
 app.get("/api/oauth2callback", async (req, res) => {
   const { code } = req.query;
 
@@ -92,23 +119,38 @@ app.get("/api/oauth2callback", async (req, res) => {
 
   try {
     const { tokens } = await oAuth2Client.getToken(code);
+    tokens.expiry_date = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days expiry
+
+    // Store tokens in MongoDB
+    await db.collection("tokens").updateOne(
+      { userId: "default-user" },
+      {
+        $set: {
+          tokens,
+          lastUpdated: new Date(),
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
     oAuth2Client.setCredentials(tokens);
-
-    // Store tokens in environment variable
-    process.env.GOOGLE_TOKENS = JSON.stringify(tokens);
-
-    res.send("Authentication successful! You can close this window.");
+    res.send(
+      "Authentication successful! Token stored in database. You can close this window."
+    );
   } catch (error) {
     console.error("Error retrieving access token:", error);
-    res.status(500).json({ error: "Failed to retrieve access token" });
+    res.status(500).json({
+      error: "Failed to retrieve access token",
+      details: error.message,
+    });
   }
 });
 
-// Create meeting endpoint
+// Create meeting endpoint with MongoDB token retrieval
 app.post("/api/create-meeting", async (req, res) => {
   const { summary, description, startTime, endTime, attendees } = req.body;
 
-  // Validate required fields
   if (!summary || !startTime || !endTime || !attendees) {
     return res.status(400).json({
       error: "Missing required fields",
@@ -116,17 +158,57 @@ app.post("/api/create-meeting", async (req, res) => {
     });
   }
 
-  // Check authentication
-  const tokens = process.env.GOOGLE_TOKENS;
-  if (!tokens) {
-    return res
-      .status(401)
-      .json({ error: "Not authenticated. Please login first." });
-  }
-
   try {
-    // Set credentials from environment variable
-    oAuth2Client.setCredentials(JSON.parse(tokens));
+    // Get tokens from MongoDB
+    const tokenDoc = await db
+      .collection("tokens")
+      .findOne({ userId: "default-user" });
+
+    if (!tokenDoc || !tokenDoc.tokens) {
+      return res.status(401).json({
+        error: "Not authenticated",
+        message: "Please login first",
+        loginUrl: "/api/login",
+      });
+    }
+
+    const tokens = tokenDoc.tokens;
+
+    // Check if token is expired
+    if (isTokenExpired(tokens)) {
+      if (tokens.refresh_token) {
+        // Refresh the token
+        const { credentials } = await oAuth2Client.refreshToken(
+          tokens.refresh_token
+        );
+        const newTokens = {
+          ...tokens,
+          access_token: credentials.access_token,
+          expiry_date: Date.now() + 30 * 24 * 60 * 60 * 1000,
+        };
+
+        // Update tokens in MongoDB
+        await db.collection("tokens").updateOne(
+          { userId: "default-user" },
+          {
+            $set: {
+              tokens: newTokens,
+              lastUpdated: new Date(),
+            },
+          }
+        );
+
+        oAuth2Client.setCredentials(newTokens);
+      } else {
+        return res.status(401).json({
+          error: "Token expired",
+          message: "No refresh token available. Please login again.",
+          loginUrl: "/api/login",
+        });
+      }
+    } else {
+      oAuth2Client.setCredentials(tokens);
+    }
 
     const meetingLink = await createGoogleMeet(
       summary,
@@ -136,16 +218,59 @@ app.post("/api/create-meeting", async (req, res) => {
       attendees
     );
 
-    res.json({ meetingLink });
+    res.json({
+      meetingLink,
+      tokenStatus: {
+        expiresAt: new Date(tokens.expiry_date).toISOString(),
+        isExpired: isTokenExpired(tokens),
+      },
+    });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error("Error creating meeting:", error);
+    res.status(500).json({
+      error: "Failed to create meeting",
+      details: error.message,
+    });
+  }
+});
+
+// Token status endpoint
+app.get("/api/token-status", async (req, res) => {
+  try {
+    const tokenDoc = await db
+      .collection("tokens")
+      .findOne({ userId: "default-user" });
+    if (!tokenDoc || !tokenDoc.tokens) {
+      return res.json({
+        isAuthenticated: false,
+        message: "No token found",
+        loginUrl: "/api/login",
+      });
+    }
+
+    const tokens = tokenDoc.tokens;
+    res.json({
+      isAuthenticated: true,
+      isExpired: isTokenExpired(tokens),
+      expiresAt: new Date(tokens.expiry_date).toISOString(),
+      lastUpdated: tokenDoc.lastUpdated,
+      createdAt: tokenDoc.createdAt,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Failed to check token status",
+      details: error.message,
+    });
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error(err.stack);
-  res.status(500).json({ error: "Something went wrong!" });
+  res.status(500).json({
+    error: "Something went wrong!",
+    details: err.message,
+  });
 });
 
 // Start server only in development
@@ -157,6 +282,7 @@ if (process.env.NODE_ENV !== "production") {
     console.log("- GET  /api/login          : Start OAuth2 flow");
     console.log("- GET  /api/oauth2callback  : OAuth2 callback URL");
     console.log("- POST /api/create-meeting  : Create a new Google Meet");
+    console.log("- GET  /api/token-status   : Check token status");
   });
 }
 
